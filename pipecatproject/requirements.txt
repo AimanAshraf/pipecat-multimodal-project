@@ -14,5 +14,6 @@ pytest
 pillow
 requests
 aiofiles
+tensorflow
 moviepy==1.0.3
 setuptools==75.6.0
