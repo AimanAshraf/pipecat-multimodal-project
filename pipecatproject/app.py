@@ -1,9 +1,9 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pipecat import AudioFrame, ImageFrame, TextFrame
@@ -156,6 +156,76 @@ async def process_text(payload: Dict[str, str]) -> JSONResponse:
         "response": response_text,
         "metadata": result_frame.metadata if result_frame else {},
     })
+
+
+# ── WebSocket: continuous video frame streaming ────────────────────────────
+@app.websocket("/ws/video")
+async def ws_video(websocket: WebSocket) -> None:
+    """
+    Receives continuous JPEG frames from the browser.
+    Each message is raw bytes (a JPEG image).
+    Responds with a JSON object containing face_emotion.
+    """
+    await websocket.accept()
+    logger.info("WebSocket /ws/video connected")
+    try:
+        while True:
+            frame_bytes = await websocket.receive_bytes()
+            if not frame_bytes:
+                continue
+            emotion_label, confidence = emotion_service.analyze_face_emotion(frame_bytes)
+            await websocket.send_json({
+                "face_emotion": {
+                    "emotion": emotion_label,
+                    "confidence": round(float(confidence), 4),
+                }
+            })
+    except WebSocketDisconnect:
+        logger.info("WebSocket /ws/video disconnected")
+    except Exception as exc:
+        logger.error("WebSocket /ws/video error: %s", exc, exc_info=True)
+        await websocket.close(code=1011)
+
+
+# ── WebSocket: continuous audio streaming ──────────────────────────────────
+@app.websocket("/ws/audio")
+async def ws_audio(websocket: WebSocket) -> None:
+    """
+    Receives audio chunks from the browser (webm/opus blobs).
+    Each message is a complete audio blob to transcribe + run through the pipeline.
+    Responds with JSON containing transcript and AI response.
+    """
+    await websocket.accept()
+    logger.info("WebSocket /ws/audio connected")
+    deepgram_service = DeepgramService()
+    try:
+        while True:
+            audio_bytes = await websocket.receive_bytes()
+            if not audio_bytes:
+                continue
+
+            frame = AudioFrame(payload=audio_bytes)
+            task = await runner.submit(frame)
+            await runner.queue.join()
+            result_frame = runner.tasks[task.task_id].result
+
+            response_payload = ""
+            transcript = ""
+            if isinstance(result_frame, TextFrame):
+                response_payload = result_frame.payload or ""
+                transcript = result_frame.metadata.get("transcript", "")
+
+            await websocket.send_json({
+                "task_id": task.task_id,
+                "transcript": transcript,
+                "response": response_payload,
+                "metadata": result_frame.metadata if result_frame else {},
+            })
+    except WebSocketDisconnect:
+        logger.info("WebSocket /ws/audio disconnected")
+    except Exception as exc:
+        logger.error("WebSocket /ws/audio error: %s", exc, exc_info=True)
+        await websocket.close(code=1011)
 
 
 @app.post("/api/multimodal")

@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
+websockets
 httpx
 python-dotenv
+python-multipart
 transformers
 torch
 opencv-python-headless
