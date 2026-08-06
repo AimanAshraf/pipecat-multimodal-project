@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Emotion Mentor</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+
+    <!-- ============ SIDEBAR : all controls, always visible ============ -->
+    <aside class="control-rail">
+      <div class="rail-brand">
+        <span class="brand-mark">EM</span>
+        <div>
+          <p class="brand-name">Emotion Mentor</p>
+          <p class="brand-sub">Signal console</p>
+        </div>
+      </div>
+
+      <nav class="rail-groups">
+        <div class="rail-group">
+          <p class="rail-label">Session</p>
+          <button id="startButton" class="rail-btn rail-btn-primary">Start Session</button>
+          <button id="stopSessionButton" class="rail-btn rail-btn-danger">Stop Session</button>
+        </div>
+
+        <div class="rail-group">
+          <p class="rail-label">Camera</p>
+          <button id="startCameraButton" class="rail-btn">Start Camera</button>
+          <button id="stopCameraButton" class="rail-btn rail-btn-danger">Stop Camera</button>
+          <button id="captureImageButton" class="rail-btn">Extract Frame</button>
+        </div>
+
+        <div class="rail-group">
+          <p class="rail-label">Microphone</p>
+          <button id="startMicrophoneButton" class="rail-btn">Start Microphone</button>
+          <button id="stopMicrophoneButton" class="rail-btn rail-btn-danger">Stop Microphone</button>
+        </div>
+
+        <div class="rail-group">
+          <p class="rail-label">Voice capture</p>
+          <button id="startRecordingButton" class="rail-btn">Start Recording</button>
+          <button id="stopRecordingButton" class="rail-btn rail-btn-danger">Stop Recording</button>
+          <button id="sendVoiceButton" class="rail-btn rail-btn-primary">Send Voice</button>
+        </div>
+
+        <div class="rail-group">
+          <p class="rail-label">Message</p>
+          <button id="sendTextButton" class="rail-btn rail-btn-primary">Send Text</button>
+          <button id="sendMultimodalButton" class="rail-btn rail-btn-primary">Send Multimodal</button>
+        </div>
+      </nav>
+    </aside>
+
+    <!-- ============ MAIN ============ -->
+    <main class="main-area">
+      <header class="main-topbar">
+        <div>
+          <p class="topbar-sub">Analyzing voice, text, and facial cues in one live console.</p>
+        </div>
+        <div class="status-pill">
+          <span class="status-dot"></span>
+          <span id="statusMessage">Ready to connect.</span>
+        </div>
+      </header>
+
+      <div class="main-grid">
+
+        <!-- readouts: transcript / response / metadata -->
+        <section class="panel readouts-panel">
+          <div class="readout-tile">
+            <span class="tile-title">Voice transcript</span>
+            <div id="voiceTranscript" class="tile-value">No voice recorded yet.</div>
+          </div>
+          <div class="readout-tile">
+            <span class="tile-title">Assistant response</span>
+            <div id="responseText" class="tile-value">No response yet.</div>
+          </div>
+          <div class="readout-tile">
+            <span class="tile-title">Emotion metadata</span>
+            <pre id="emotionMetadata" class="tile-value emotion-data">No data yet.</pre>
+          </div>
+        </section>
+
+        <!-- camera -->
+        <section class="panel camera-panel">
+          <div class="panel-header-row">
+            <h2>Camera</h2>
+            <span class="panel-note">Live feed</span>
+          </div>
+          <video id="camera" autoplay muted playsinline></video>
+        </section>
+
+        <!-- composer: text + image -->
+        <section class="panel composer-panel">
+          <div class="panel-header-row">
+            <h2>Message</h2>
+            <span class="panel-note">Text and visual context</span>
+          </div>
+
+          <div class="composer-body">
+            <div class="composer-text">
+              <label for="messageInput" class="field-label">Message</label>
+              <textarea id="messageInput" placeholder="Describe how you're feeling..."></textarea>
+            </div>
+
+            <div class="composer-image">
+              <label for="imageUploadInput" class="field-label">Upload image</label>
+              <div class="image-input-row">
+                <input type="file" id="imageUploadInput" accept="image/*" />
+                <button id="uploadImageButton" class="rail-btn image-inline-btn">Analyze</button>
+              </div>
+
+              <div class="preview-panel">
+                <div class="preview-status" id="imageSourceLabel">No image selected</div>
+                <img id="imagePreview" alt="Captured or uploaded image preview" />
+                <div class="image-source-selection">
+                  <label>
+                    <input type="radio" id="useCapturedImageRadio" name="imageSource" value="captured" />
+                    Captured frame
+                  </label>
+                  <label>
+                    <input type="radio" id="useUploadedImageRadio" name="imageSource" value="uploaded" />
+                    Uploaded image
+                  </label>
+                </div>
+                <div class="preview-actions">
+                  <button id="sendFrameButton" class="rail-btn preview-clear-button">Send Frame</button>
+                  <button id="clearCapturedFrameButton" class="rail-btn preview-clear-button">Cancel Frame</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js?v=5" defer></script>
+</body>
+</html>
