@@ -12,3 +12,4 @@ pytest
 pillow
 requests
 aiofiles
+moviepy==1.0.3
