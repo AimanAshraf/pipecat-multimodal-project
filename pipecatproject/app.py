@@ -1,7 +1,7 @@
-import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -9,13 +9,10 @@ from fastapi.staticfiles import StaticFiles
 from pipecat import AudioFrame, ImageFrame, TextFrame
 from pipeline import create_runner
 from processors.emotion_fusion_processor import EmotionFusionProcessor
-from services.cartesia_service import CartesiaService
 from services.deepgram_service import DeepgramService
 from services.emotion_service import EmotionService
 from services.groq_service import GroqService
 from utils.logger import get_logger
-
-emotion_service: Optional[EmotionService] = None
 
 logger = get_logger(__name__)
 app = FastAPI(title="Emotion-Aware Conversational AI Assistant")
@@ -23,9 +20,24 @@ app = FastAPI(title="Emotion-Aware Conversational AI Assistant")
 frontend_dir = Path(__file__).resolve().parent / "frontend"
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
+emotion_service: Optional[EmotionService] = None
 runner = None
 
 
+# ── Shared streaming state ─────────────────────────────────────────────────
+# WebSocket endpoints write here; /api/multimodal reads from here so it always
+# has the latest browser-streamed face and speech data available.
+@dataclass
+class StreamingState:
+    face_emotion: Dict[str, Any] = field(default_factory=lambda: {"emotion": "neutral", "confidence": 0.0})
+    speech_emotion: Dict[str, Any] = field(default_factory=lambda: {"emotion": "neutral", "confidence": 0.0})
+    transcript: str = ""
+
+
+_stream_state = StreamingState()
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 def _assert_task_success(task):
     if task.error:
         logger.error("Pipeline task %s failed", task.task_id, exc_info=task.error)
@@ -36,6 +48,7 @@ def _assert_task_success(task):
     return task.result
 
 
+# ── Lifecycle ──────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event() -> None:
     global runner, emotion_service
@@ -53,6 +66,7 @@ async def shutdown_event() -> None:
         logger.info("Pipeline runner stopped")
 
 
+# ── Static / UI ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index() -> Any:
     file_path = frontend_dir / "index.html"
@@ -61,9 +75,9 @@ async def index() -> Any:
     return FileResponse(file_path)
 
 
+# ── REST endpoints (unchanged) ─────────────────────────────────────────────
 @app.post("/api/audio")
 async def process_audio(request: Request) -> JSONResponse:
-    global runner
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty audio payload")
@@ -88,7 +102,6 @@ async def process_audio(request: Request) -> JSONResponse:
 
 @app.post("/api/image")
 async def process_image(request: Request) -> JSONResponse:
-    global runner
     content_type = request.headers.get("content-type", "")
     body = await request.body()
 
@@ -102,10 +115,10 @@ async def process_image(request: Request) -> JSONResponse:
         except AssertionError:
             raise HTTPException(
                 status_code=400,
-                detail="python-multipart is not installed. Send raw image bytes instead of multipart form data.",
+                detail="python-multipart is not installed. Send raw image bytes instead.",
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Could not parse multipart form data: {exc}")
+            raise HTTPException(status_code=400, detail=f"Could not parse form data: {exc}")
 
     if not body:
         raise HTTPException(status_code=400, detail="Empty image payload")
@@ -119,7 +132,6 @@ async def process_image(request: Request) -> JSONResponse:
 
 @app.post("/api/text")
 async def process_text(payload: Dict[str, str]) -> JSONResponse:
-    global runner
     text = payload.get("text", "")
     if not text:
         raise HTTPException(status_code=400, detail="Missing text payload")
@@ -129,13 +141,10 @@ async def process_text(payload: Dict[str, str]) -> JSONResponse:
     task_result = runner.tasks[task.task_id]
     result_frame = _assert_task_success(task_result)
 
-    payload = getattr(result_frame, "payload", "")
-    if isinstance(payload, str):
-        payload = payload.strip()
-    # Prefer explicit payload, but fall back to metadata-stored response_text for robustness
-    if payload:
-        response_text = payload
-    else:
+    response_text = getattr(result_frame, "payload", "")
+    if isinstance(response_text, str):
+        response_text = response_text.strip()
+    if not response_text:
         response_text = (
             result_frame.metadata.get("response_text")
             or result_frame.metadata.get("generated_text")
@@ -146,10 +155,7 @@ async def process_text(payload: Dict[str, str]) -> JSONResponse:
             response_text = response_text.strip()
         if not response_text:
             response_text = "Sorry, I couldn't generate a response at the moment."
-    if not payload:
-        logger.warning(
-            "/api/text returning fallback response because task payload was empty or whitespace",
-        )
+        logger.warning("/api/text returning fallback response because task payload was empty")
 
     return JSONResponse({
         "task_id": task.task_id,
@@ -162,9 +168,11 @@ async def process_text(payload: Dict[str, str]) -> JSONResponse:
 @app.websocket("/ws/video")
 async def ws_video(websocket: WebSocket) -> None:
     """
-    Receives continuous JPEG frames from the browser.
-    Each message is raw bytes (a JPEG image).
-    Responds with a JSON object containing face_emotion.
+    Receives JPEG frames from the browser (~300-500 ms cadence).
+    Runs face emotion detection and stores the result in shared state so
+    /api/multimodal always has the latest face reading available.
+    Returns the prediction to the frontend after each frame.
+    No cv2.VideoCapture — all frames come from the browser.
     """
     await websocket.accept()
     logger.info("WebSocket /ws/video connected")
@@ -173,27 +181,39 @@ async def ws_video(websocket: WebSocket) -> None:
             frame_bytes = await websocket.receive_bytes()
             if not frame_bytes:
                 continue
+
             emotion_label, confidence = emotion_service.analyze_face_emotion(frame_bytes)
-            await websocket.send_json({
-                "face_emotion": {
-                    "emotion": emotion_label,
-                    "confidence": round(float(confidence), 4),
-                }
-            })
+
+            # Update shared state for multimodal fusion
+            _stream_state.face_emotion = {
+                "emotion": emotion_label,
+                "confidence": round(float(confidence), 4),
+            }
+
+            await websocket.send_json({"face_emotion": _stream_state.face_emotion})
+
     except WebSocketDisconnect:
         logger.info("WebSocket /ws/video disconnected")
     except Exception as exc:
         logger.error("WebSocket /ws/video error: %s", exc, exc_info=True)
-        await websocket.close(code=1011)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
-# ── WebSocket: continuous audio streaming ──────────────────────────────────
+# ── WebSocket: continuous audio chunk streaming ────────────────────────────
 @app.websocket("/ws/audio")
 async def ws_audio(websocket: WebSocket) -> None:
     """
-    Receives audio chunks from the browser (webm/opus blobs).
-    Each message is a complete audio blob to transcribe + run through the pipeline.
-    Responds with JSON containing transcript and AI response.
+    Receives small MediaRecorder chunks (~500-1000 ms) from the browser.
+    Uses DeepgramService to transcribe each chunk, then runs speech emotion
+    classification via the existing EmotionService. Stores the latest
+    transcript and speech emotion in shared state for multimodal fusion.
+    Does NOT run the full Pipecat pipeline or generate AI responses here —
+    that happens in /api/multimodal when the user explicitly triggers it.
+    Returns the transcript + speech emotion back to the frontend.
+    No PyAudio or server-side mic access.
     """
     await websocket.accept()
     logger.info("WebSocket /ws/audio connected")
@@ -204,33 +224,55 @@ async def ws_audio(websocket: WebSocket) -> None:
             if not audio_bytes:
                 continue
 
-            frame = AudioFrame(payload=audio_bytes)
-            task = await runner.submit(frame)
-            await runner.queue.join()
-            result_frame = runner.tasks[task.task_id].result
+            # Transcribe via Deepgram
+            try:
+                transcript_payload = await deepgram_service.transcribe(audio_bytes)
+                transcript = deepgram_service.parse_transcript(transcript_payload)
+            except Exception as exc:
+                logger.warning("Deepgram transcription failed in WS: %s", exc)
+                transcript = ""
 
-            response_payload = ""
-            transcript = ""
-            if isinstance(result_frame, TextFrame):
-                response_payload = result_frame.payload or ""
-                transcript = result_frame.metadata.get("transcript", "")
+            # Speech emotion classification on transcript text
+            speech_label, speech_confidence = ("neutral", 0.0)
+            if transcript.strip():
+                speech_label, speech_confidence = emotion_service.classify_text_emotion(transcript)
+
+            # Update shared state for multimodal fusion
+            _stream_state.transcript = transcript
+            _stream_state.speech_emotion = {
+                "emotion": speech_label,
+                "confidence": round(float(speech_confidence), 4),
+            }
 
             await websocket.send_json({
-                "task_id": task.task_id,
                 "transcript": transcript,
-                "response": response_payload,
-                "metadata": result_frame.metadata if result_frame else {},
+                "speech_emotion": _stream_state.speech_emotion,
             })
+
     except WebSocketDisconnect:
         logger.info("WebSocket /ws/audio disconnected")
     except Exception as exc:
         logger.error("WebSocket /ws/audio error: %s", exc, exc_info=True)
-        await websocket.close(code=1011)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
 
+# ── Multimodal endpoint ────────────────────────────────────────────────────
 @app.post("/api/multimodal")
 async def process_multimodal(request: Request) -> JSONResponse:
-    global runner, emotion_service
+    """
+    Weighted fusion: face=0.55, text=0.30, speech=0.15.
+
+    Accepts explicit image/audio/text via multipart form (original behaviour).
+    If the browser has an active WebSocket stream, the latest face and speech
+    emotion from _stream_state are used as fallback / supplement so the
+    multimodal endpoint always has up-to-date predictions even when the user
+    did not upload a fresh frame or audio blob for this specific request.
+    """
+    global emotion_service
+
     if emotion_service is None:
         raise HTTPException(status_code=500, detail="Emotion service is unavailable")
 
@@ -253,30 +295,32 @@ async def process_multimodal(request: Request) -> JSONResponse:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse multipart form data: {exc}")
 
-    if not image_bytes or not audio_bytes or not text:
-        raise HTTPException(status_code=400, detail="Image, audio, and text are all required for multimodal input.")
+    if not text:
+        raise HTTPException(status_code=400, detail="text field is required.")
 
-    face_emotion_label, face_confidence = emotion_service.analyze_face_emotion(image_bytes)
-    face_emotion = {
-        "emotion": face_emotion_label,
-        "confidence": float(face_confidence),
-    }
+    # ── Face emotion: use uploaded image or fall back to latest WS state ──
+    if image_bytes:
+        face_label, face_conf = emotion_service.analyze_face_emotion(image_bytes)
+        face_emotion = {"emotion": face_label, "confidence": float(face_conf)}
+    else:
+        face_emotion = _stream_state.face_emotion
 
-    deepgram_service = DeepgramService()
-    transcript_payload = await deepgram_service.transcribe(audio_bytes)
-    transcript = deepgram_service.parse_transcript(transcript_payload)
-    speech_label, speech_confidence = emotion_service.classify_text_emotion(transcript)
-    speech_sentiment = {
-        "emotion": speech_label,
-        "confidence": float(speech_confidence),
-    }
+    # ── Speech emotion: use uploaded audio or fall back to latest WS state ─
+    if audio_bytes:
+        deepgram_service = DeepgramService()
+        transcript_payload = await deepgram_service.transcribe(audio_bytes)
+        transcript = deepgram_service.parse_transcript(transcript_payload)
+        speech_label, speech_conf = emotion_service.classify_text_emotion(transcript) if transcript.strip() else ("neutral", 0.0)
+        speech_sentiment = {"emotion": speech_label, "confidence": float(speech_conf)}
+    else:
+        transcript = _stream_state.transcript
+        speech_sentiment = _stream_state.speech_emotion
 
-    text_label, text_confidence = emotion_service.classify_text_emotion(text)
-    text_emotion = {
-        "emotion": text_label,
-        "confidence": float(text_confidence),
-    }
+    # ── Text emotion (always from the text field) ──────────────────────────
+    text_label, text_conf = emotion_service.classify_text_emotion(text)
+    text_emotion = {"emotion": text_label, "confidence": float(text_conf)}
 
+    # ── Weighted fusion (face=0.55, text=0.30, speech=0.15) ───────────────
     fusion = EmotionFusionProcessor()._fuse_emotions(face_emotion, text_emotion, speech_sentiment)
 
     multimodal_frame = TextFrame(payload=text, metadata={
@@ -293,12 +337,10 @@ async def process_multimodal(request: Request) -> JSONResponse:
     task_result = runner.tasks[task.task_id]
     result_frame = _assert_task_success(task_result)
 
-    payload = getattr(result_frame, "payload", "")
-    if isinstance(payload, str):
-        payload = payload.strip()
-    if payload:
-        response_text = payload
-    else:
+    response_text = getattr(result_frame, "payload", "")
+    if isinstance(response_text, str):
+        response_text = response_text.strip()
+    if not response_text:
         response_text = (
             result_frame.metadata.get("response_text")
             or result_frame.metadata.get("generated_text")
