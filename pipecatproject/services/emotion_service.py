@@ -22,10 +22,9 @@ class EmotionService:
             tokenizer=self.tokenizer,
             return_all_scores=True,
         )
-        # mtcnn=False uses OpenCV Haarcascade for detection (no PyTorch MTCNN)
-        # and FER's built-in lightweight CNN for classification — significantly
-        # lighter than the mtcnn=True path which loads MTCNN + a ViT-based model.
-        self.face_detector = FER(mtcnn=False)
+        # mtcnn=True uses MTCNN for accurate face detection and a ViT-based
+        # emotion classifier — best accuracy for webcam input.
+        self.face_detector = FER(mtcnn=True)
 
     def classify_text_emotion(self, text: str) -> Tuple[str, float]:
         if not text.strip():
