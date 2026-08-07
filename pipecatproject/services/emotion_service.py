@@ -18,20 +18,27 @@ FACE_EMOTION_MODEL = "trpakov/vit-face-expression"
 class EmotionService:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.pipeline = pipeline(
-            "text-classification",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            return_all_scores=True,
-        )
-        # Face models are lazy-loaded on first use — see _ensure_face_pipeline.
+        self._tokenizer = None
+        self._model = None
+        self._text_pipeline = None
         self._face_detector: Optional[MTCNN] = None
         self._face_emotion_pipeline = None
 
+    def _ensure_text_pipeline(self) -> None:
+        """Lazily instantiate the text-emotion model on first use."""
+        if self._text_pipeline is None:
+            logger.info("Loading text emotion model: %s", self.model_name)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+            self._text_pipeline = pipeline(
+                "text-classification",
+                model=self._model,
+                tokenizer=self._tokenizer,
+                return_all_scores=True,
+            )
+
     def _ensure_face_pipeline(self) -> None:
-        """Lazily instantiate face detector + emotion classifier on first call."""
+        """Lazily instantiate face detector + emotion classifier on first use."""
         if self._face_detector is None:
             logger.info("Loading MTCNN face detector")
             self._face_detector = MTCNN(keep_all=False, post_process=False, device="cpu")
@@ -48,7 +55,8 @@ class EmotionService:
             return EmotionLabel.NEUTRAL.value, 0.0
 
         try:
-            results = self.pipeline(text)
+            self._ensure_text_pipeline()
+            results = self._text_pipeline(text)
             if not results:
                 return EmotionLabel.NEUTRAL.value, 0.0
 
