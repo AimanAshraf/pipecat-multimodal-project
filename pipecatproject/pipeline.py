@@ -23,7 +23,7 @@ def build_pipeline(
         MetricsProcessor(),
         LoggingProcessor(),
         DeepgramProcessor(),
-        FaceEmotionProcessor(),
+        FaceEmotionProcessor(emotion_service=emotion_service),
         TextEmotionProcessor(emotion_service=emotion_service),
         EmotionFusionProcessor(),
         ConversationContextProcessor(),
@@ -35,6 +35,6 @@ def build_pipeline(
 
 async def create_runner(emotion_service: EmotionService, groq_service: GroqService) -> PipelineRunner:
     pipeline = build_pipeline(emotion_service=emotion_service, groq_service=groq_service)
-    runner = PipelineRunner(pipeline=pipeline, max_workers=4)
+    runner = PipelineRunner(pipeline=pipeline, max_workers=2)
     await runner.start()
     return runner
