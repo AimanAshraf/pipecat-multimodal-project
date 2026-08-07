@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 from facenet_pytorch import MTCNN
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
@@ -24,12 +25,26 @@ class EmotionService:
         self._face_detector: Optional[MTCNN] = None
         self._face_emotion_pipeline = None
 
+    def _quantize(self, model: torch.nn.Module, label: str) -> torch.nn.Module:
+        """Apply int8 dynamic quantization to linear layers to reduce memory footprint."""
+        try:
+            quantized = torch.quantization.quantize_dynamic(
+                model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            logger.info("%s model quantized to int8", label)
+            return quantized
+        except Exception as exc:
+            logger.warning("Quantization failed for %s, falling back to fp32: %s", label, exc)
+            return model
+
     def _ensure_text_pipeline(self) -> None:
         """Lazily instantiate the text-emotion model on first use."""
         if self._text_pipeline is None:
             logger.info("Loading text emotion model: %s", self.model_name)
             self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+            self._model.eval()
+            self._model = self._quantize(self._model, "Text emotion")
             self._text_pipeline = pipeline(
                 "text-classification",
                 model=self._model,
@@ -48,6 +63,10 @@ class EmotionService:
                 "image-classification",
                 model=FACE_EMOTION_MODEL,
                 device=-1,  # CPU
+            )
+            self._face_emotion_pipeline.model.eval()
+            self._face_emotion_pipeline.model = self._quantize(
+                self._face_emotion_pipeline.model, "Face emotion"
             )
 
     def classify_text_emotion(self, text: str) -> Tuple[str, float]:
