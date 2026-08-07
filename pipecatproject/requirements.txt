@@ -5,9 +5,9 @@ httpx
 python-dotenv
 python-multipart
 transformers
-torch
 opencv-python-headless
-fer
+facenet-pytorch
+torchvision==0.23.0
 pydantic
 sse-starlette
 pytest

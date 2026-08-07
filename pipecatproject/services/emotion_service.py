@@ -1,37 +1,62 @@
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from fer.fer import FER
+from PIL import Image
+from facenet_pytorch import MTCNN
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from models.emotion import EmotionLabel
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Torch-native facial emotion classifier — replaces fer/keras/tensorflow.
+FACE_EMOTION_MODEL = "trpakov/vit-face-expression"
+
 
 class EmotionService:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.pipeline = pipeline(
-            "text-classification",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            return_all_scores=True,
-        )
-        # mtcnn=True uses MTCNN for accurate face detection and a ViT-based
-        # emotion classifier — best accuracy for webcam input.
-        self.face_detector = FER(mtcnn=True)
+        self._tokenizer = None
+        self._model = None
+        self._text_pipeline = None
+        self._face_detector: Optional[MTCNN] = None
+        self._face_emotion_pipeline = None
+
+    def _ensure_text_pipeline(self) -> None:
+        """Lazily instantiate the text-emotion model on first use."""
+        if self._text_pipeline is None:
+            logger.info("Loading text emotion model: %s", self.model_name)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+            self._text_pipeline = pipeline(
+                "text-classification",
+                model=self._model,
+                tokenizer=self._tokenizer,
+                return_all_scores=True,
+            )
+
+    def _ensure_face_pipeline(self) -> None:
+        """Lazily instantiate face detector + emotion classifier on first use."""
+        if self._face_detector is None:
+            logger.info("Loading MTCNN face detector")
+            self._face_detector = MTCNN(keep_all=False, post_process=False, device="cpu")
+        if self._face_emotion_pipeline is None:
+            logger.info("Loading face emotion model: %s", FACE_EMOTION_MODEL)
+            self._face_emotion_pipeline = pipeline(
+                "image-classification",
+                model=FACE_EMOTION_MODEL,
+                device=-1,  # CPU
+            )
 
     def classify_text_emotion(self, text: str) -> Tuple[str, float]:
         if not text.strip():
             return EmotionLabel.NEUTRAL.value, 0.0
 
         try:
-            results = self.pipeline(text)
+            self._ensure_text_pipeline()
+            results = self._text_pipeline(text)
             if not results:
                 return EmotionLabel.NEUTRAL.value, 0.0
 
@@ -65,32 +90,46 @@ class EmotionService:
 
     def analyze_face_emotion(self, image_bytes: bytes) -> Tuple[str, float]:
         try:
+            self._ensure_face_pipeline()
             image = self._decode_image(image_bytes)
             logger.info("Decoded image shape: %s", image.shape)
-            detection = self.face_detector.detect_emotions(image)
-            logger.info("FER raw detection result: %s", detection)
-            if detection:
-                top_face = detection[0]
-                emotions = top_face.get("emotions", {})
-                logger.info("Raw emotion scores: %s", emotions)
-                mapped = self._map_label(emotions)
-                if mapped[0] != EmotionLabel.NEUTRAL.value or max(emotions.values(), default=0.0) > 0.3:
-                    return mapped
-                logger.info("FER mapped emotion was neutral or low confidence, falling back to top_emotion")
 
-            top_label, top_score = self.face_detector.top_emotion(image)
-            logger.info("FER top emotion fallback: %s %s", top_label, top_score)
-            if top_label:
-                return self._map_label({top_label: top_score})
+            pil_image = Image.fromarray(image)
+            boxes, probs = self._face_detector.detect(pil_image)
 
-            logger.warning("No face detected in frame")
-            return EmotionLabel.NEUTRAL.value, 0.0
+            if boxes is None or len(boxes) == 0:
+                logger.warning("No face detected in frame")
+                return EmotionLabel.NEUTRAL.value, 0.0
+
+            x1, y1, x2, y2 = [int(v) for v in boxes[0]]
+            x1, y1 = max(x1, 0), max(y1, 0)
+            x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)
+            face_crop = pil_image.crop((x1, y1, x2, y2))
+
+            if face_crop.width == 0 or face_crop.height == 0:
+                logger.warning("Detected face crop was empty")
+                return EmotionLabel.NEUTRAL.value, 0.0
+
+            results = self._face_emotion_pipeline(face_crop)
+            logger.info("Face emotion raw results: %s", results)
+
+            scores = {
+                self._normalize_label(item["label"]): item["score"]
+                for item in results
+                if "label" in item and "score" in item
+            }
+            if not scores:
+                return EmotionLabel.NEUTRAL.value, 0.0
+
+            mapped = self._map_label(scores)
+            logger.info("Face emotion classified: %s %s", mapped[0], mapped[1])
+            return mapped
         except Exception as exc:
             logger.error("Face emotion analysis failed: %s", exc, exc_info=True)
             return EmotionLabel.NEUTRAL.value, 0.0
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray:
-        """Decode raw image bytes into an RGB numpy array for FER/MTCNN."""
+        """Decode raw image bytes into an RGB numpy array."""
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
         image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if image_bgr is None:
