@@ -538,7 +538,8 @@ input[type="file"] {
   }
 
   html, body {
-    overflow: auto;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
 
   .control-rail {
@@ -547,6 +548,7 @@ input[type="file"] {
     overflow-x: auto;
     border-right: none;
     border-bottom: 1px solid var(--border-soft);
+    -webkit-overflow-scrolling: touch;
   }
 
   .rail-brand {
@@ -590,5 +592,228 @@ input[type="file"] {
 
   .composer-body {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Tablet / small laptop: tighten spacing, keep two-column feel ---- */
+@media (max-width: 900px) {
+  .main-area {
+    padding: 16px;
+  }
+
+  .readouts-panel {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ================= MOBILE PHONES ================= */
+@media (max-width: 640px) {
+  :root {
+    font-size: 14px;
+  }
+
+  html, body {
+    height: auto;
+  }
+
+  .app-shell {
+    display: block;
+  }
+
+  /* Sidebar becomes a slim, sticky, horizontally-scrolling toolbar so
+     every control stays reachable and visible while the page scrolls. */
+  .control-rail {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    width: 100%;
+    height: auto;
+    max-height: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 0;
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+    box-shadow: var(--shadow-md);
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    scrollbar-width: thin;
+  }
+
+  .rail-brand {
+    flex-shrink: 0;
+    border-bottom: none;
+    border-right: 1px solid var(--border-soft);
+    padding: 0 10px 0 0;
+    margin-right: 10px;
+  }
+
+  .brand-mark {
+    width: 26px;
+    height: 26px;
+    font-size: 0.68rem;
+    border-radius: 7px;
+  }
+
+  .brand-name {
+    font-size: 0.78rem;
+  }
+
+  .brand-sub {
+    display: none;
+  }
+
+  .rail-groups {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 10px;
+    width: max-content;
+  }
+
+  .rail-group {
+    flex-direction: row;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 5px;
+    padding-right: 10px;
+    border-right: 1px solid var(--border-soft);
+  }
+
+  .rail-group:last-child {
+    border-right: none;
+    padding-right: 0;
+  }
+
+  /* Group labels collapse to a tiny inline tag instead of stacking above */
+  .rail-label {
+    display: none;
+  }
+
+  .rail-btn {
+    width: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+    min-height: 34px;
+    padding: 7px 11px;
+    font-size: 0.74rem;
+    text-align: center;
+  }
+
+  /* Main content area */
+  .main-area {
+    padding: 14px;
+    gap: 12px;
+  }
+
+  .main-topbar {
+    gap: 8px;
+  }
+
+  .topbar-sub {
+    font-size: 0.8rem;
+  }
+
+  .status-pill {
+    width: 100%;
+    justify-content: center;
+    padding: 8px 14px;
+  }
+
+  .main-grid {
+    gap: 12px;
+  }
+
+  /* Stack the three readout tiles full width instead of a 3-col grid */
+  .readouts-panel {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .readout-tile {
+    padding: 14px 16px;
+  }
+
+  .tile-value {
+    max-height: 160px;
+  }
+
+  .panel {
+    padding: 14px 16px;
+    border-radius: 14px;
+  }
+
+  /* Camera gets a fixed, comfortable height instead of stretching */
+  .camera-panel {
+    order: -1;
+  }
+
+  #camera {
+    min-height: 220px;
+    max-height: 320px;
+  }
+
+  /* Composer: text box then image tools, stacked */
+  .composer-body {
+    gap: 14px;
+  }
+
+  textarea {
+    min-height: 110px;
+  }
+
+  .image-input-row {
+    flex-direction: column;
+  }
+
+  .image-inline-btn {
+    width: 100%;
+  }
+
+  .preview-panel {
+    grid-template-rows: auto;
+  }
+
+  #imagePreview {
+    max-height: 160px;
+  }
+
+  .image-source-selection {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .image-source-selection label {
+    justify-content: flex-start;
+  }
+
+  .preview-actions {
+    flex-direction: column;
+  }
+
+  .preview-actions .rail-btn {
+    min-height: 44px;
+  }
+}
+
+/* ---- Very small phones ---- */
+@media (max-width: 380px) {
+  :root {
+    font-size: 13px;
+  }
+
+  .rail-btn {
+    padding: 6px 9px;
+    font-size: 0.7rem;
+    min-height: 32px;
+  }
+
+  .rail-group {
+    gap: 4px;
+    padding-right: 8px;
   }
 }
