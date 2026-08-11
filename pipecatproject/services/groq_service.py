@@ -80,3 +80,7 @@ class GroqService:
             logger.warning("Groq generated an empty response for prompt")
             return "Sorry, I couldn't generate a response at the moment."
         return result
+
+    async def generate(self, prompt: str) -> str:
+        """Alias for generate_response"""
+        return await self.generate_response(prompt)

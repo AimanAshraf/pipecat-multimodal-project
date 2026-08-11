@@ -1,188 +1,669 @@
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, Optional
+import os
 
 import cv2
 import numpy as np
-import torch
-from PIL import Image
-from facenet_pytorch import MTCNN
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+
+# Fix for Python 3.13 compatibility with FER
+try:
+    import pkg_resources
+except ModuleNotFoundError:
+    # Python 3.13+ deprecated pkg_resources
+    # Create a functional shim for FER compatibility
+    import sys
+    from types import ModuleType
+    from pathlib import Path
+    
+    pkg_resources = ModuleType('pkg_resources')
+    
+    def resource_filename(package_name, resource_name):
+        """Minimal implementation for FER model loading"""
+        # FER tries to load its model from its package directory
+        try:
+            import fer
+            fer_path = Path(fer.__file__).parent
+            return str(fer_path / resource_name)
+        except Exception:
+            # Fallback: return the resource name as-is
+            return resource_name
+    
+    pkg_resources.resource_filename = resource_filename
+    sys.modules['pkg_resources'] = pkg_resources
+
+from fer.fer import FER
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    pipeline,
+)
+
 from models.emotion import EmotionLabel
 from utils.logger import get_logger
 
-logger = get_logger(__name__)
 
-# Torch-native facial emotion classifier — replaces fer/keras/tensorflow.
-FACE_EMOTION_MODEL = "trpakov/vit-face-expression"
+logger = get_logger(__name__)
 
 
 class EmotionService:
+    """
+    Centralized emotion-analysis service.
+
+    Supports:
+        1. Text emotion classification
+        2. Face emotion classification from webcam frames
+        3. Speech emotion classification from transcribed audio
+        4. Normalization of all emotion labels into the application's
+           six supported emotions.
+
+    Supported emotions:
+        - happy
+        - sad
+        - angry
+        - fear
+        - surprise
+        - neutral
+
+    The actual multimodal fusion is intentionally kept outside this
+    service in EmotionFusionProcessor.
+    """
+
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self._tokenizer = None
-        self._model = None
-        self._text_pipeline = None
-        self._face_detector: Optional[MTCNN] = None
-        self._face_emotion_pipeline = None
 
-    def _quantize(self, model: torch.nn.Module, label: str) -> torch.nn.Module:
-        """Apply int8 dynamic quantization to linear layers to reduce memory footprint."""
+        logger.info(
+            "Loading text emotion model: %s",
+            model_name,
+        )
+
+        # ---------------------------------------------------------
+        # TEXT EMOTION MODEL
+        # ---------------------------------------------------------
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name
+        )
+
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_name
+        )
+
+        self.pipeline = pipeline(
+            "text-classification",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            return_all_scores=True,
+        )
+
+        # ---------------------------------------------------------
+        # FACE EMOTION MODEL
+        # ---------------------------------------------------------
+
+        logger.info("Loading FER face emotion detector...")
+
+        self.face_detector = FER(
+            mtcnn=True
+        )
+
+        logger.info("EmotionService initialized successfully.")
+
+    # =============================================================
+    # TEXT EMOTION
+    # =============================================================
+
+    def classify_text_emotion(
+        self,
+        text: str,
+    ) -> Tuple[str, float]:
+        """
+        Classify emotion from text.
+
+        Returns:
+            (emotion, confidence)
+        """
+
+        if not text or not text.strip():
+            return (
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            )
+
         try:
-            quantized = torch.quantization.quantize_dynamic(
-                model, {torch.nn.Linear}, dtype=torch.qint8
-            )
-            logger.info("%s model quantized to int8", label)
-            return quantized
-        except Exception as exc:
-            logger.warning("Quantization failed for %s, falling back to fp32: %s", label, exc)
-            return model
+            results = self.pipeline(text)
 
-    def _ensure_text_pipeline(self) -> None:
-        """Lazily instantiate the text-emotion model on first use."""
-        if self._text_pipeline is None:
-            logger.info("Loading text emotion model: %s", self.model_name)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-            self._model.eval()
-            self._model = self._quantize(self._model, "Text emotion")
-            self._text_pipeline = pipeline(
-                "text-classification",
-                model=self._model,
-                tokenizer=self._tokenizer,
-                return_all_scores=True,
-            )
-
-    def _ensure_face_pipeline(self) -> None:
-        """Lazily instantiate face detector + emotion classifier on first use."""
-        if self._face_detector is None:
-            logger.info("Loading MTCNN face detector")
-            self._face_detector = MTCNN(keep_all=False, post_process=False, device="cpu")
-        if self._face_emotion_pipeline is None:
-            logger.info("Loading face emotion model: %s", FACE_EMOTION_MODEL)
-            self._face_emotion_pipeline = pipeline(
-                "image-classification",
-                model=FACE_EMOTION_MODEL,
-                device=-1,  # CPU
-            )
-            self._face_emotion_pipeline.model.eval()
-            self._face_emotion_pipeline.model = self._quantize(
-                self._face_emotion_pipeline.model, "Face emotion"
-            )
-
-    def classify_text_emotion(self, text: str) -> Tuple[str, float]:
-        if not text.strip():
-            return EmotionLabel.NEUTRAL.value, 0.0
-
-        try:
-            self._ensure_text_pipeline()
-            results = self._text_pipeline(text)
             if not results:
-                return EmotionLabel.NEUTRAL.value, 0.0
+                return (
+                    EmotionLabel.NEUTRAL.value,
+                    0.0,
+                )
+
+            # Depending on the Transformers version/configuration,
+            # pipeline output can be:
+            #
+            # [
+            #     {"label": "...", "score": ...},
+            #     ...
+            # ]
+            #
+            # or:
+            #
+            # [
+            #     [
+            #         {"label": "...", "score": ...},
+            #         ...
+            #     ]
+            # ]
 
             if isinstance(results, dict):
                 results = [results]
 
-            if isinstance(results[0], dict) and "label" in results[0]:
-                scores = {
-                    self._normalize_label(item["label"]): item.get("score", 0.0)
-                    for item in results
-                    if isinstance(item, dict) and "label" in item
-                }
-            elif isinstance(results[0], list):
-                scores = {
-                    self._normalize_label(item["label"]): item.get("score", 0.0)
-                    for item in results[0]
-                    if isinstance(item, dict) and "label" in item
-                }
-            else:
-                return EmotionLabel.NEUTRAL.value, 0.0
+            if (
+                isinstance(results, list)
+                and results
+                and isinstance(results[0], list)
+            ):
+                results = results[0]
+
+            if not isinstance(results, list):
+                return (
+                    EmotionLabel.NEUTRAL.value,
+                    0.0,
+                )
+
+            scores: Dict[str, float] = {}
+
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+
+                label = item.get("label")
+
+                if not label:
+                    continue
+
+                score = float(
+                    item.get("score", 0.0)
+                )
+
+                normalized_label = self._normalize_label(
+                    label
+                )
+
+                # Multiple source labels can map to the same
+                # application emotion. Keep the highest score.
+                scores[normalized_label] = max(
+                    scores.get(normalized_label, 0.0),
+                    score,
+                )
 
             if not scores:
-                return EmotionLabel.NEUTRAL.value, 0.0
+                return (
+                    EmotionLabel.NEUTRAL.value,
+                    0.0,
+                )
 
-            mapped = self._map_label(scores)
-            logger.info("Text emotion classified: %s %s", mapped[0], mapped[1])
-            return mapped
+            result = self._map_label(scores)
+
+            logger.info(
+                "Text emotion: %s (%.4f)",
+                result[0],
+                result[1],
+            )
+
+            return result
+
         except Exception as exc:
-            logger.error("Text emotion classification failed: %s", exc, exc_info=True)
-            return EmotionLabel.NEUTRAL.value, 0.0
+            logger.error(
+                "Text emotion classification failed: %s",
+                exc,
+                exc_info=True,
+            )
 
-    def analyze_face_emotion(self, image_bytes: bytes) -> Tuple[str, float]:
+            return (
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            )
+
+    # =============================================================
+    # SPEECH EMOTION
+    # =============================================================
+
+    def classify_speech_emotion(
+        self,
+        transcript: str,
+    ) -> Tuple[str, float]:
+        """
+        Classify emotion from speech transcription.
+
+        The current architecture uses the speech transcript as the
+        semantic representation of the user's voice.
+
+        Deepgram is responsible for STT.
+        This method is responsible for emotion classification.
+
+        This is intentionally separate from text classification so
+        the WebSocket/audio pipeline can clearly distinguish:
+
+            microphone
+                ↓
+            Deepgram STT
+                ↓
+            speech emotion
+        """
+
+        if not transcript or not transcript.strip():
+            return (
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            )
+
+        return self.classify_text_emotion(
+            transcript
+        )
+
+    # =============================================================
+    # FACE EMOTION
+    # =============================================================
+
+    def analyze_face_emotion(
+        self,
+        image_bytes: bytes,
+    ) -> Tuple[str, float]:
+        """
+        Analyze facial emotion from a JPEG/PNG image.
+
+        The image originates from the browser webcam.
+
+        Important:
+            There is NO cv2.VideoCapture(0) here.
+
+        This allows the backend to run on AWS/cloud infrastructure
+        without requiring access to a server-side webcam.
+
+        Returns:
+            (emotion, confidence)
+        """
+
         try:
-            self._ensure_face_pipeline()
-            image = self._decode_image(image_bytes)
-            logger.info("Decoded image shape: %s", image.shape)
+            image = self._decode_image(
+                image_bytes
+            )
 
-            pil_image = Image.fromarray(image)
-            boxes, probs = self._face_detector.detect(pil_image)
+            logger.debug(
+                "Decoded image shape: %s",
+                image.shape,
+            )
 
-            if boxes is None or len(boxes) == 0:
-                logger.warning("No face detected in frame")
-                return EmotionLabel.NEUTRAL.value, 0.0
+            detection = (
+                self.face_detector.detect_emotions(
+                    image
+                )
+            )
 
-            x1, y1, x2, y2 = [int(v) for v in boxes[0]]
-            x1, y1 = max(x1, 0), max(y1, 0)
-            x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)
-            face_crop = pil_image.crop((x1, y1, x2, y2))
+            logger.debug(
+                "FER detection count: %s",
+                len(detection) if detection else 0,
+            )
 
-            if face_crop.width == 0 or face_crop.height == 0:
-                logger.warning("Detected face crop was empty")
-                return EmotionLabel.NEUTRAL.value, 0.0
+            # -----------------------------------------------------
+            # FACE FOUND
+            # -----------------------------------------------------
 
-            results = self._face_emotion_pipeline(face_crop)
-            logger.info("Face emotion raw results: %s", results)
+            if detection:
+                # FER can detect multiple faces.
+                #
+                # For the current application we use the face with
+                # the largest bounding box, rather than blindly
+                # assuming detection[0] is always the user.
+                top_face = self._select_primary_face(
+                    detection
+                )
 
-            scores = {
-                self._normalize_label(item["label"]): item["score"]
-                for item in results
-                if "label" in item and "score" in item
-            }
-            if not scores:
-                return EmotionLabel.NEUTRAL.value, 0.0
+                if top_face:
+                    emotions = top_face.get(
+                        "emotions",
+                        {},
+                    )
 
-            mapped = self._map_label(scores)
-            logger.info("Face emotion classified: %s %s", mapped[0], mapped[1])
-            return mapped
+                    if emotions:
+                        logger.debug(
+                            "Face emotion scores: %s",
+                            emotions,
+                        )
+
+                        emotion, confidence = (
+                            self._map_label(
+                                emotions
+                            )
+                        )
+
+                        logger.info(
+                            "Face emotion: %s (%.4f)",
+                            emotion,
+                            confidence,
+                        )
+
+                        return (
+                            emotion,
+                            confidence,
+                        )
+
+            # -----------------------------------------------------
+            # FALLBACK
+            # -----------------------------------------------------
+
+            logger.debug(
+                "No usable FER detection; trying top_emotion()."
+            )
+
+            top_label, top_score = (
+                self.face_detector.top_emotion(
+                    image
+                )
+            )
+
+            if top_label:
+                normalized = self._normalize_label(
+                    top_label
+                )
+
+                logger.info(
+                    "FER fallback emotion: %s (%.4f)",
+                    normalized,
+                    float(top_score or 0.0),
+                )
+
+                return (
+                    normalized,
+                    float(top_score or 0.0),
+                )
+
+            logger.debug(
+                "No face detected."
+            )
+
+            return (
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            )
+
         except Exception as exc:
-            logger.error("Face emotion analysis failed: %s", exc, exc_info=True)
-            return EmotionLabel.NEUTRAL.value, 0.0
+            logger.error(
+                "Face emotion analysis failed: %s",
+                exc,
+                exc_info=True,
+            )
 
-    def _decode_image(self, image_bytes: bytes) -> np.ndarray:
-        """Decode raw image bytes into an RGB numpy array."""
-        arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return (
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            )
+
+    # =============================================================
+    # IMAGE DECODING
+    # =============================================================
+
+    def _decode_image(
+        self,
+        image_bytes: bytes,
+    ) -> np.ndarray:
+        """
+        Convert browser image bytes into an RGB NumPy image.
+
+        Browser:
+            canvas.toBlob()
+                ↓
+            JPEG bytes
+
+        Backend:
+            bytes
+                ↓
+            cv2.imdecode()
+                ↓
+            BGR
+                ↓
+            RGB
+        """
+
+        if not image_bytes:
+            raise ValueError(
+                "Image data is empty."
+            )
+
+        arr = np.frombuffer(
+            image_bytes,
+            dtype=np.uint8,
+        )
+
+        image_bgr = cv2.imdecode(
+            arr,
+            cv2.IMREAD_COLOR,
+        )
+
         if image_bgr is None:
-            raise ValueError("Failed to decode image bytes; not a valid image format")
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            raise ValueError(
+                "Failed to decode image bytes; "
+                "input is not a valid image."
+            )
+
+        image_rgb = cv2.cvtColor(
+            image_bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+
         return image_rgb
 
-    def _normalize_label(self, label: str) -> str:
-        normalized_label = label.strip().lower()
+    # =============================================================
+    # PRIMARY FACE SELECTION
+    # =============================================================
+
+    def _select_primary_face(
+        self,
+        detections: list,
+    ) -> Optional[dict]:
+        """
+        Select the largest detected face.
+
+        This is useful when the webcam frame contains more than one
+        face. The largest face is treated as the primary/user face.
+        """
+
+        if not detections:
+            return None
+
+        best_face = None
+        best_area = -1
+
+        for face in detections:
+            try:
+                box = face.get(
+                    "box",
+                    [],
+                )
+
+                if len(box) != 4:
+                    continue
+
+                _, _, width, height = box
+
+                area = max(
+                    0,
+                    width,
+                ) * max(
+                    0,
+                    height,
+                )
+
+                if area > best_area:
+                    best_area = area
+                    best_face = face
+
+            except Exception:
+                continue
+
+        # If bounding boxes were malformed, fall back to the first
+        # detection instead of failing the entire frame.
+        if best_face is None:
+            return detections[0]
+
+        return best_face
+
+    # =============================================================
+    # LABEL NORMALIZATION
+    # =============================================================
+
+    def _normalize_label(
+        self,
+        label: str,
+    ) -> str:
+        """
+        Convert labels from different models into the application's
+        common six-emotion vocabulary.
+        """
+
+        if not label:
+            return EmotionLabel.NEUTRAL.value
+
+        normalized_label = (
+            str(label)
+            .strip()
+            .lower()
+        )
+
         label_map = {
+            # Happy
             "joy": "happy",
             "happiness": "happy",
+            "contentment": "happy",
+            "content": "happy",
+            "trust": "happy",
+
+            # Sad
             "sadness": "sad",
+
+            # Angry
             "anger": "angry",
+            "disgust": "angry",
+
+            # Fear
             "fear": "fear",
+
+            # Surprise
             "surprise": "surprise",
+
+            # Neutral
             "neutral": "neutral",
             "calm": "neutral",
-            "disgust": "angry",
-            "contentment": "happy",
-            "trust": "happy",
             "anticipation": "neutral",
         }
-        return label_map.get(normalized_label, normalized_label)
 
-    def _map_label(self, scores: Dict[str, float]) -> Tuple[str, float]:
-        normalized = {key.lower(): value for key, value in scores.items()}
+        return label_map.get(
+            normalized_label,
+            normalized_label,
+        )
+
+    # =============================================================
+    # MAP EMOTION SCORES
+    # =============================================================
+
+    def _map_label(
+        self,
+        scores: Dict[str, float],
+    ) -> Tuple[str, float]:
+        """
+        Convert arbitrary emotion-score dictionaries into the
+        application's six supported labels.
+
+        Example FER output:
+
+            {
+                "angry": 0.05,
+                "disgust": 0.01,
+                "fear": 0.02,
+                "happy": 0.80,
+                "sad": 0.04,
+                "surprise": 0.08
+            }
+
+        Result:
+
+            ("happy", 0.80)
+        """
+
+        normalized: Dict[str, float] = {}
+
+        for key, value in scores.items():
+            try:
+                label = self._normalize_label(
+                    key
+                )
+
+                score = float(value)
+
+                # Multiple labels can normalize into the same
+                # application label. Keep the maximum score.
+                normalized[label] = max(
+                    normalized.get(label, 0.0),
+                    score,
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
         candidates = {
-            EmotionLabel.HAPPY.value: normalized.get("happy", 0.0),
-            EmotionLabel.SAD.value: normalized.get("sad", 0.0),
-            EmotionLabel.ANGRY.value: normalized.get("angry", 0.0),
-            EmotionLabel.FEAR.value: normalized.get("fear", 0.0),
-            EmotionLabel.SURPRISE.value: normalized.get("surprise", 0.0),
-            EmotionLabel.NEUTRAL.value: normalized.get("neutral", 0.0),
+            EmotionLabel.HAPPY.value: normalized.get(
+                EmotionLabel.HAPPY.value,
+                0.0,
+            ),
+            EmotionLabel.SAD.value: normalized.get(
+                EmotionLabel.SAD.value,
+                0.0,
+            ),
+            EmotionLabel.ANGRY.value: normalized.get(
+                EmotionLabel.ANGRY.value,
+                0.0,
+            ),
+            EmotionLabel.FEAR.value: normalized.get(
+                EmotionLabel.FEAR.value,
+                0.0,
+            ),
+            EmotionLabel.SURPRISE.value: normalized.get(
+                EmotionLabel.SURPRISE.value,
+                0.0,
+            ),
+            EmotionLabel.NEUTRAL.value: normalized.get(
+                EmotionLabel.NEUTRAL.value,
+                0.0,
+            ),
         }
-        best = max(candidates.items(), key=lambda item: item[1])
-        return best
+
+        best_emotion, best_score = max(
+            candidates.items(),
+            key=lambda item: item[1],
+        )
+
+        return (
+            best_emotion,
+            float(best_score),
+        )
+
+    # =============================================================
+    # UTILITY
+    # =============================================================
+
+    def get_supported_emotions(self) -> list:
+        """
+        Return the emotion vocabulary used by the application.
+        """
+
+        return [
+            EmotionLabel.HAPPY.value,
+            EmotionLabel.SAD.value,
+            EmotionLabel.ANGRY.value,
+            EmotionLabel.FEAR.value,
+            EmotionLabel.SURPRISE.value,
+            EmotionLabel.NEUTRAL.value,
+        ]
