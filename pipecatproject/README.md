@@ -54,19 +54,3 @@ Then open `frontend/index.html` in a browser or serve it from the backend static
 2. Start the Daily WebRTC session.
 3. Allow camera and microphone access.
 4. Speak naturally and watch the assistant analyze mood, respond empathetically, and generate voice output.
-
-## Testing
-
-Run tests with:
-
-```bash
-pytest
-```
-
-## Future Improvements
-
-- Replace rule-based fusion with a learned fusion model
-- Add speaker diarization and multi-user support
-- Improve face detection latency with MediaPipe
-- Add a React frontend for richer interaction
-- Expand memory with personalized user profiles
